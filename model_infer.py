@@ -1,106 +1,107 @@
 import torch
-import torchvision
-from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
-import os
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-import face_recognition
-from torch.autograd import Variable
-import time
-import sys
 from torch import nn
-from torchvision import models
+from torchvision import models, transforms
+from torch.utils.data import Dataset
+import cv2
+import numpy as np
+import os
 
-
-# -------------------------------------------
-# Custom Dataset (Video Frames -> Faces)
-# -------------------------------------------
-class DeepfakeDataset(Dataset):
-    def __init__(self, video_path, transform=None, max_frames=100):
-        self.video_path = video_path
-        self.transform = transform
-        self.frames = self._extract_frames(max_frames)
-
-    def _extract_frames(self, max_frames):
-        frames = []
-        cap = cv2.VideoCapture(self.video_path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        step = max(1, total // max_frames)
-
-        count = 0
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if count % step == 0:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb)
-
-                for top, right, bottom, left in face_locations:
-                    face = rgb[top:bottom, left:right]
-                    frames.append(face)
-            count += 1
-        cap.release()
-        return frames
-
-    def __len__(self):
-        return len(self.frames)
-
-    def __getitem__(self, idx):
-        face = self.frames[idx]
-        if self.transform:
-            face = self.transform(face)
-        return face
-
-
-# -------------------------------------------
-# Deepfake Detection Model (ResNet18)
-# -------------------------------------------
-class DeepfakeModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super(DeepfakeModel, self).__init__()
-        base_model = models.resnet18(pretrained=True)
-        num_ftrs = base_model.fc.in_features
-        base_model.fc = nn.Linear(num_ftrs, num_classes)
-        self.model = base_model
+# -------------------
+# Model Definition
+# -------------------
+class DeepfakeDetector(nn.Module):
+    def __init__(self, num_classes=2, latent_dim=2048, lstm_layers=1, hidden_dim=2048, bidirectional=False):
+        super(DeepfakeDetector, self).__init__()
+        base_model = models.resnext50_32x4d(pretrained=True)
+        self.feature_extractor = nn.Sequential(*list(base_model.children())[:-2])
+        self.lstm = nn.LSTM(latent_dim, hidden_dim, lstm_layers, bidirectional)
+        self.relu = nn.LeakyReLU()
+        self.dropout = nn.Dropout(0.4)
+        self.classifier = nn.Linear(2048, num_classes)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x):
-        return self.model(x)
+        batch_size, seq_length, c, h, w = x.shape
+        x = x.view(batch_size * seq_length, c, h, w)
+        fmap = self.feature_extractor(x)
+        x = self.global_pool(fmap)
+        x = x.view(batch_size, seq_length, 2048)
+        x_lstm, _ = self.lstm(x, None)
+        return fmap, self.dropout(self.classifier(x_lstm[:, -1, :]))
 
+# -------------------
+# Video Dataset Loader
+# -------------------
+class VideoDataset(Dataset):
+    def __init__(self, video_paths, sequence_length=20, transform=None):
+        self.video_paths = video_paths
+        self.transform = transform
+        self.sequence_length = sequence_length
 
-# -------------------------------------------
-# Inference Function
-# -------------------------------------------
-def predict_video(video_path, model_path, device="cpu"):
+    def __len__(self):
+        return len(self.video_paths)
+
+    def __getitem__(self, idx):
+        video_path = self.video_paths[idx]
+        frames = []
+        for _, frame in enumerate(self.extract_frames(video_path)):
+            if self.transform:
+                frame = self.transform(frame)
+            frames.append(frame)
+            if len(frames) == self.sequence_length:
+                break
+
+        frames = torch.stack(frames)
+        frames = frames[:self.sequence_length]
+        return frames.unsqueeze(0)
+
+    def extract_frames(self, path):
+        cap = cv2.VideoCapture(path)
+        success, image = cap.read()
+        while success:
+            yield image
+            success, image = cap.read()
+        cap.release()
+
+# -------------------
+# Utility Functions
+# -------------------
+softmax = nn.Softmax()
+
+async def classify_video_frames(model, frames_tensor):
+    """Run forward pass and return prediction + confidence."""
+    _, logits = model(frames_tensor.to("cpu"))
+    probs = softmax(logits)
+    predicted_class = torch.argmax(probs, dim=1).item()
+    confidence = probs[0, predicted_class].item() * 100
+
+    return {
+        "label": predicted_class,
+        "confidence": confidence
+    }
+
+async def detect_deepfake(video_path: str, model_path="./model_97_acc_100_frames_FF_data.pt"):
+    """Full pipeline: load model, process video, return result."""
+    im_size = 112
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
     transform = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
+        transforms.Resize((im_size, im_size)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
+        transforms.Normalize(mean, std)
     ])
 
-    dataset = DeepfakeDataset(video_path, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
+    dataset = VideoDataset([video_path], sequence_length=20, transform=transform)
 
-    model = DeepfakeModel(num_classes=2)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
+    model = DeepfakeDetector(num_classes=2)
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+
+    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
     model.eval()
 
-    preds = []
-    with torch.no_grad():
-        for faces in dataloader:
-            faces = faces.to(device)
-            outputs = model(faces)
-            _, predicted = torch.max(outputs, 1)
-            preds.extend(predicted.cpu().numpy())
-
-    # Majority Voting
-    fake_score = np.mean(preds)
-    if fake_score > 0.5:
-        return "FAKE", fake_score
-    else:
-        return "REAL", 1 - fake_score
+    result = await classify_video_frames(model, dataset[0])
+    return result
